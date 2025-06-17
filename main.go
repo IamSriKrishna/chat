@@ -131,7 +131,6 @@ func main() {
 	log.Fatal(app.Listen("0.0.0.0:4000"))
 
 }
-
 func registerUser(c *fiber.Ctx) error {
 	log.Printf("📝 Registration request from %s", c.IP())
 
@@ -143,14 +142,34 @@ func registerUser(c *fiber.Ctx) error {
 
 	log.Printf("📝 Attempting to register user: %s", user.Username)
 
+	// First, check if user already exists
+	var existingUser User
+	err := usersColl.FindOne(context.TODO(), bson.M{"username": user.Username}).Decode(&existingUser)
+
+	if err == nil {
+		// User already exists, return existing user data
+		log.Printf("✅ User already exists, returning existing data: %s", user.Username)
+		return c.JSON(existingUser)
+	} else if err != mongo.ErrNoDocuments {
+		// Some other database error occurred
+		log.Printf("❌ Database error while checking user: %v", err)
+		return c.Status(500).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	// User doesn't exist, create new user
 	user.IsOnline = false
 	user.ID = primitive.NewObjectID()
 
-	_, err := usersColl.InsertOne(context.TODO(), user)
+	_, err = usersColl.InsertOne(context.TODO(), user)
 	if err != nil {
+		// Handle the rare case where user was created between our check and insert
 		if mongo.IsDuplicateKeyError(err) {
-			log.Printf("⚠️ Username already exists: %s", user.Username)
-			return c.Status(409).JSON(fiber.Map{"error": "Username already exists"})
+			// Try to fetch the user that was just created
+			err = usersColl.FindOne(context.TODO(), bson.M{"username": user.Username}).Decode(&existingUser)
+			if err == nil {
+				log.Printf("✅ User was created concurrently, returning existing data: %s", user.Username)
+				return c.JSON(existingUser)
+			}
 		}
 		log.Printf("❌ Failed to create user: %v", err)
 		return c.Status(500).JSON(fiber.Map{"error": "Failed to create user"})
