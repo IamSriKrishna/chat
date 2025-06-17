@@ -128,8 +128,8 @@ func main() {
 	log.Println("📡 Health check: http://localhost:4000/health")
 	log.Println("👥 Users API: http://localhost:4000/api/users")
 	log.Println("📝 Register API: http://localhost:4000/api/register")
+	log.Fatal(app.Listen("0.0.0.0:4000"))
 
-	log.Fatal(app.Listen("13.203.227.174:4000"))
 }
 
 func registerUser(c *fiber.Ctx) error {
