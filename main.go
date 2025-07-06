@@ -117,7 +117,7 @@ func updateRoomActivity(roomID string) {
 }
 
 func main() {
-	log.Println("Starting Enhanced Chat Server...")
+	log.Println("✨✨✨Starting Enhanced Chat Server...")
 
 	// Connect to MongoDB
 	log.Println("Connecting to MongoDB...")
