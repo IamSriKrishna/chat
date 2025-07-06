@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -115,7 +117,70 @@ func updateRoomActivity(roomID string) {
 		bson.M{"$set": bson.M{"last_activity": time.Now()}},
 	)
 }
+func initializeFCM() (*messaging.Client, error) {
+	log.Println("🔧 Initializing FCM...")
 
+	// Check if service account file exists
+	serviceAccountPath := "chat-81418-firebase-adminsdk-fbsvc-725ead91cf.json"
+	if _, err := os.Stat(serviceAccountPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("service account file not found: %s", serviceAccountPath)
+	}
+
+	// Read and validate the service account file
+	serviceAccountData, err := os.ReadFile(serviceAccountPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read service account file: %v", err)
+	}
+
+	// Parse the service account JSON to validate it
+	var serviceAccount map[string]interface{}
+	if err := json.Unmarshal(serviceAccountData, &serviceAccount); err != nil {
+		return nil, fmt.Errorf("invalid service account JSON: %v", err)
+	}
+
+	// Check required fields
+	requiredFields := []string{"type", "project_id", "private_key_id", "private_key", "client_email", "client_id", "auth_uri", "token_uri"}
+	for _, field := range requiredFields {
+		if _, exists := serviceAccount[field]; !exists {
+			return nil, fmt.Errorf("missing required field in service account: %s", field)
+		}
+	}
+
+	projectID, ok := serviceAccount["project_id"].(string)
+	if !ok {
+		return nil, fmt.Errorf("invalid project_id in service account")
+	}
+
+	clientEmail, ok := serviceAccount["client_email"].(string)
+	if !ok {
+		return nil, fmt.Errorf("invalid client_email in service account")
+	}
+
+	log.Printf("📋 Service Account Details:")
+	log.Printf("   Project ID: %s", projectID)
+	log.Printf("   Client Email: %s", clientEmail)
+	log.Printf("   Service Account Type: %s", serviceAccount["type"])
+
+	// Initialize Firebase with the service account
+	opt := option.WithCredentialsFile(serviceAccountPath)
+	config := &firebase.Config{
+		ProjectID: projectID, // Use project ID from service account
+	}
+
+	ctx := context.Background()
+	firebaseApp, err := firebase.NewApp(ctx, config, opt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize Firebase app: %v", err)
+	}
+
+	client, err := firebaseApp.Messaging(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create FCM client: %v", err)
+	}
+
+	log.Println("✅ FCM initialized successfully")
+	return client, nil
+}
 func main() {
 	log.Println("✨✨✨Starting Enhanced Chat Server...")
 
@@ -141,28 +206,29 @@ func main() {
 
 	// Create indexes
 	log.Println("Creating database indexes...")
-
-	// User indexes
 	usersColl.Indexes().CreateOne(context.TODO(), mongo.IndexModel{
 		Keys:    bson.D{{Key: "username", Value: 1}},
 		Options: options.Index().SetUnique(true),
 	})
-
-	// Message indexes for better query performance
 	msgsColl.Indexes().CreateOne(context.TODO(), mongo.IndexModel{
 		Keys: bson.D{{Key: "room_id", Value: 1}, {Key: "timestamp", Value: 1}},
 	})
 	msgsColl.Indexes().CreateOne(context.TODO(), mongo.IndexModel{
 		Keys: bson.D{{Key: "from", Value: 1}, {Key: "to", Value: 1}},
 	})
-
-	// Room indexes
 	roomsColl.Indexes().CreateOne(context.TODO(), mongo.IndexModel{
 		Keys:    bson.D{{Key: "room_id", Value: 1}},
 		Options: options.Index().SetUnique(true),
 	})
-
 	log.Println("✓ Database indexes created")
+
+	// Initialize FCM with better error handling
+	fcmClient, err = initializeFCM()
+	if err != nil {
+		log.Printf("⚠️ FCM initialization failed: %v", err)
+		log.Printf("⚠️ Push notifications will be disabled")
+		fcmClient = nil
+	}
 
 	app := fiber.New(fiber.Config{
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
@@ -171,37 +237,16 @@ func main() {
 		},
 	})
 
-	// Add request logging
 	app.Use(logger.New(logger.Config{
 		Format: "[${time}] ${status} - ${method} ${path} - ${latency}\n",
 	}))
 
-	// CORS middleware
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
 		AllowHeaders: "Origin, Content-Type, Accept",
 		AllowMethods: "GET,POST,PUT,DELETE,OPTIONS",
 	}))
-	// Initialize FCM
-	log.Println("Initializing FCM...")
-	opt := option.WithCredentialsFile("chat-81418-firebase-adminsdk-fbsvc-725ead91cf.json")
-	config := &firebase.Config{
-		ProjectID: "chat-81418", // Replace with your actual Firebase project ID
-	}
-	firebaseApp, err := firebase.NewApp(context.Background(), config, opt)
-	if err != nil {
-		log.Printf("⚠️ FCM initialization failed: %v", err)
-		fcmClient = nil
-	} else {
-		fcmClient, err = firebaseApp.Messaging(context.Background())
-		if err != nil {
-			log.Printf("⚠️ FCM client creation failed: %v", err)
-			fcmClient = nil
-		} else {
-			log.Println("✓ FCM initialized successfully")
-		}
-	}
-	// WebSocket upgrade middleware
+
 	app.Use("/ws", func(c *fiber.Ctx) error {
 		if websocket.IsWebSocketUpgrade(c) {
 			c.Locals("allowed", true)
@@ -210,12 +255,12 @@ func main() {
 		return fiber.ErrUpgradeRequired
 	})
 
-	// Add a health check endpoint
 	app.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{
-			"status":    "ok",
-			"timestamp": time.Now(),
-			"message":   "Enhanced Chat server is running",
+			"status":     "ok",
+			"timestamp":  time.Now(),
+			"message":    "Enhanced Chat server is running",
+			"fcm_status": fcmClient != nil,
 		})
 	})
 
@@ -226,13 +271,11 @@ func main() {
 	app.Get("/api/rooms/:username", getUserRooms)
 	app.Post("/api/messages/mark-read", markMessagesAsRead)
 	app.Get("/ws/:username", websocket.New(handleWebSocket))
-
+	app.Post("/api/test-fcm", testFCM)
 	app.Post("/api/update-fcm-token", updateFCMToken)
+
 	log.Println("✓ Routes configured")
 	log.Println("🚀 Server starting on :4000")
-	log.Println("📡 Health check: http://localhost:4000/health")
-	log.Println("👥 Users API: http://localhost:4000/api/users")
-	log.Println("📝 Register API: http://localhost:4000/api/register")
 	log.Fatal(app.Listen("0.0.0.0:4000"))
 }
 func updateFCMToken(c *fiber.Ctx) error {
@@ -293,6 +336,86 @@ func updateFCMToken(c *fiber.Ctx) error {
 		"username": req.Username,
 	})
 }
+func testFCM(c *fiber.Ctx) error {
+	var req struct {
+		Token string `json:"token"`
+	}
+
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "Invalid request"})
+	}
+
+	if req.Token == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "FCM token is required"})
+	}
+
+	if fcmClient == nil {
+		return c.Status(500).JSON(fiber.Map{
+			"error":   "FCM not initialized",
+			"details": "Check server logs for FCM initialization errors",
+		})
+	}
+
+	// Validate FCM token format (basic check)
+	if len(req.Token) < 100 {
+		return c.Status(400).JSON(fiber.Map{
+			"error":   "Invalid FCM token format",
+			"details": "FCM tokens are typically 152+ characters long",
+		})
+	}
+
+	// Create test message
+	message := &messaging.Message{
+		Token: req.Token,
+		Notification: &messaging.Notification{
+			Title: "🔔 Test Notification",
+			Body:  "FCM is working correctly!",
+		},
+		Data: map[string]string{
+			"test":      "true",
+			"timestamp": time.Now().Format(time.RFC3339),
+		},
+		Android: &messaging.AndroidConfig{
+			Priority: "high",
+			Notification: &messaging.AndroidNotification{
+				Icon:  "ic_notification",
+				Color: "#4CAF50",
+				Sound: "default",
+			},
+		},
+		APNS: &messaging.APNSConfig{
+			Payload: &messaging.APNSPayload{
+				Aps: &messaging.Aps{
+					Badge: func() *int { i := 1; return &i }(),
+					Sound: "default",
+				},
+			},
+		},
+	}
+
+	// Send test notification with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	log.Printf("📤 Sending test FCM notification...")
+	response, err := fcmClient.Send(ctx, message)
+	if err != nil {
+		log.Printf("❌ Test FCM failed: %v", err)
+		return c.Status(500).JSON(fiber.Map{
+			"error":   "Failed to send test notification",
+			"details": err.Error(),
+		})
+	}
+
+	log.Printf("✅ Test FCM sent successfully: %s", response)
+	return c.JSON(fiber.Map{
+		"success":       true,
+		"response":      response,
+		"message":       "Test notification sent successfully",
+		"token_preview": req.Token[:20] + "...",
+	})
+}
+
 func sendFCMNotification(toUsername, fromUsername, message string) {
 	if fcmClient == nil {
 		log.Println("⚠️ FCM client not initialized, skipping notification")
