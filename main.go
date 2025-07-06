@@ -184,7 +184,7 @@ func main() {
 	}))
 	// Initialize FCM
 	log.Println("Initializing FCM...")
-	opt := option.WithCredentialsFile("chat-81418-firebase-adminsdk-fbsvc-4d328ab20f.json")
+	opt := option.WithCredentialsFile("chat-81418-firebase-adminsdk-fbsvc-725ead91cf.json")
 	config := &firebase.Config{
 		ProjectID: "chat-81418", // Replace with your actual Firebase project ID
 	}
