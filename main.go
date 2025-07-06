@@ -235,7 +235,6 @@ func main() {
 	log.Println("📝 Register API: http://localhost:4000/api/register")
 	log.Fatal(app.Listen("0.0.0.0:4000"))
 }
-
 func updateFCMToken(c *fiber.Ctx) error {
 	var req struct {
 		Username string `json:"username"`
@@ -243,11 +242,41 @@ func updateFCMToken(c *fiber.Ctx) error {
 	}
 
 	if err := c.BodyParser(&req); err != nil {
+		log.Printf("❌ Invalid request body for FCM token update: %v", err)
 		return c.Status(400).JSON(fiber.Map{"error": "Invalid request body"})
 	}
 
-	// Update user's FCM token
-	result, err := usersColl.UpdateOne(
+	// Normalize input
+	req.Username = strings.TrimSpace(strings.ToLower(req.Username))
+	req.FCMToken = strings.TrimSpace(req.FCMToken)
+
+	if req.Username == "" || req.FCMToken == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "Username and FCM token are required"})
+	}
+
+	// Check if token is different from current one
+	var user User
+	err := usersColl.FindOne(context.TODO(), bson.M{"username": req.Username}).Decode(&user)
+
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			log.Printf("❌ User not found for FCM token update: %s", req.Username)
+			return c.Status(404).JSON(fiber.Map{"error": "User not found"})
+		}
+		log.Printf("❌ Database error while checking user for FCM update: %v", err)
+		return c.Status(500).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	// If token is the same, return success but no change
+	if user.FCMToken == req.FCMToken {
+		return c.JSON(fiber.Map{
+			"message":  "FCM token unchanged",
+			"username": req.Username,
+		})
+	}
+
+	// Update token
+	_, err = usersColl.UpdateOne(
 		context.TODO(),
 		bson.M{"username": req.Username},
 		bson.M{"$set": bson.M{"fcm_token": req.FCMToken}},
@@ -258,12 +287,11 @@ func updateFCMToken(c *fiber.Ctx) error {
 		return c.Status(500).JSON(fiber.Map{"error": "Failed to update FCM token"})
 	}
 
-	if result.ModifiedCount == 0 {
-		return c.Status(404).JSON(fiber.Map{"error": "User not found"})
-	}
-
-	log.Printf("✅ FCM token updated for user: %s", req.Username)
-	return c.JSON(fiber.Map{"message": "FCM token updated successfully"})
+	log.Printf("✅ FCM token updated successfully for user: %s", req.Username)
+	return c.JSON(fiber.Map{
+		"message":  "FCM token updated successfully",
+		"username": req.Username,
+	})
 }
 func sendFCMNotification(toUsername, fromUsername, message string) {
 	if fcmClient == nil {
@@ -351,12 +379,21 @@ func registerUser(c *fiber.Ctx) error {
 		// User already exists - this is essentially a "login"
 		log.Printf("✅ User already exists, logging in: %s", user.Username)
 
-		// Update the user's online status if needed
-		usersColl.UpdateOne(
+		// Update the user's online status
+		_, updateErr := usersColl.UpdateOne(
 			context.TODO(),
 			bson.M{"username": user.Username},
 			bson.M{"$set": bson.M{"is_online": true}},
 		)
+
+		if updateErr != nil {
+			log.Printf("❌ Failed to update online status: %v", updateErr)
+		} else {
+			log.Printf("✅ Updated online status for %s", user.Username)
+		}
+
+		// Return the updated user data with online status set to true
+		existingUser.IsOnline = true
 
 		return c.JSON(fiber.Map{
 			"user":    existingUser,
@@ -382,6 +419,7 @@ func registerUser(c *fiber.Ctx) error {
 			err = usersColl.FindOne(context.TODO(), bson.M{"username": user.Username}).Decode(&existingUser)
 			if err == nil {
 				log.Printf("✅ User was created concurrently, returning existing data: %s", user.Username)
+				existingUser.IsOnline = true
 				return c.JSON(fiber.Map{
 					"user":    existingUser,
 					"message": "Welcome back!",
