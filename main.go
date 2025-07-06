@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sort"
 	"strings"
 	"time"
 
+	firebase "firebase.google.com/go/v4"
+	"firebase.google.com/go/v4/messaging"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
@@ -15,12 +18,14 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"google.golang.org/api/option"
 )
 
 type User struct {
 	ID       primitive.ObjectID `json:"id" bson:"_id,omitempty"`
 	Username string             `json:"username" bson:"username"`
 	IsOnline bool               `json:"is_online" bson:"is_online"`
+	FCMToken string             `json:"fcm_token" bson:"fcm_token"`
 }
 
 type Message struct {
@@ -62,6 +67,7 @@ var (
 	usersColl *mongo.Collection
 	msgsColl  *mongo.Collection
 	roomsColl *mongo.Collection
+	fcmClient *messaging.Client
 )
 
 // Generate a consistent room ID for two users
@@ -74,11 +80,11 @@ func generateRoomID(user1, user2 string) string {
 // Get or create a chat room for two users
 func getOrCreateRoom(user1, user2 string) (string, error) {
 	roomID := generateRoomID(user1, user2)
-	
+
 	// Check if room exists
 	var room ChatRoom
 	err := roomsColl.FindOne(context.TODO(), bson.M{"room_id": roomID}).Decode(&room)
-	
+
 	if err == mongo.ErrNoDocuments {
 		// Create new room
 		room = ChatRoom{
@@ -88,7 +94,7 @@ func getOrCreateRoom(user1, user2 string) (string, error) {
 			CreatedAt:    time.Now(),
 			LastActivity: time.Now(),
 		}
-		
+
 		_, err = roomsColl.InsertOne(context.TODO(), room)
 		if err != nil {
 			return "", err
@@ -97,7 +103,7 @@ func getOrCreateRoom(user1, user2 string) (string, error) {
 	} else if err != nil {
 		return "", err
 	}
-	
+
 	return roomID, nil
 }
 
@@ -135,13 +141,13 @@ func main() {
 
 	// Create indexes
 	log.Println("Creating database indexes...")
-	
+
 	// User indexes
 	usersColl.Indexes().CreateOne(context.TODO(), mongo.IndexModel{
 		Keys:    bson.D{{Key: "username", Value: 1}},
 		Options: options.Index().SetUnique(true),
 	})
-	
+
 	// Message indexes for better query performance
 	msgsColl.Indexes().CreateOne(context.TODO(), mongo.IndexModel{
 		Keys: bson.D{{Key: "room_id", Value: 1}, {Key: "timestamp", Value: 1}},
@@ -149,13 +155,13 @@ func main() {
 	msgsColl.Indexes().CreateOne(context.TODO(), mongo.IndexModel{
 		Keys: bson.D{{Key: "from", Value: 1}, {Key: "to", Value: 1}},
 	})
-	
+
 	// Room indexes
 	roomsColl.Indexes().CreateOne(context.TODO(), mongo.IndexModel{
 		Keys:    bson.D{{Key: "room_id", Value: 1}},
 		Options: options.Index().SetUnique(true),
 	})
-	
+
 	log.Println("✓ Database indexes created")
 
 	app := fiber.New(fiber.Config{
@@ -176,7 +182,25 @@ func main() {
 		AllowHeaders: "Origin, Content-Type, Accept",
 		AllowMethods: "GET,POST,PUT,DELETE,OPTIONS",
 	}))
-
+	// Initialize FCM
+	log.Println("Initializing FCM...")
+	opt := option.WithCredentialsFile("chat-81418-firebase-adminsdk-fbsvc-4d328ab20f.json")
+	config := &firebase.Config{
+		ProjectID: "chat-81418", // Replace with your actual Firebase project ID
+	}
+	firebaseApp, err := firebase.NewApp(context.Background(), config, opt)
+	if err != nil {
+		log.Printf("⚠️ FCM initialization failed: %v", err)
+		fcmClient = nil
+	} else {
+		fcmClient, err = firebaseApp.Messaging(context.Background())
+		if err != nil {
+			log.Printf("⚠️ FCM client creation failed: %v", err)
+			fcmClient = nil
+		} else {
+			log.Println("✓ FCM initialized successfully")
+		}
+	}
 	// WebSocket upgrade middleware
 	app.Use("/ws", func(c *fiber.Ctx) error {
 		if websocket.IsWebSocketUpgrade(c) {
@@ -203,6 +227,7 @@ func main() {
 	app.Post("/api/messages/mark-read", markMessagesAsRead)
 	app.Get("/ws/:username", websocket.New(handleWebSocket))
 
+	app.Post("/api/update-fcm-token", updateFCMToken)
 	log.Println("✓ Routes configured")
 	log.Println("🚀 Server starting on :4000")
 	log.Println("📡 Health check: http://localhost:4000/health")
@@ -211,6 +236,94 @@ func main() {
 	log.Fatal(app.Listen("0.0.0.0:4000"))
 }
 
+func updateFCMToken(c *fiber.Ctx) error {
+	var req struct {
+		Username string `json:"username"`
+		FCMToken string `json:"fcm_token"`
+	}
+
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "Invalid request body"})
+	}
+
+	// Update user's FCM token
+	result, err := usersColl.UpdateOne(
+		context.TODO(),
+		bson.M{"username": req.Username},
+		bson.M{"$set": bson.M{"fcm_token": req.FCMToken}},
+	)
+
+	if err != nil {
+		log.Printf("❌ Failed to update FCM token: %v", err)
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to update FCM token"})
+	}
+
+	if result.ModifiedCount == 0 {
+		return c.Status(404).JSON(fiber.Map{"error": "User not found"})
+	}
+
+	log.Printf("✅ FCM token updated for user: %s", req.Username)
+	return c.JSON(fiber.Map{"message": "FCM token updated successfully"})
+}
+func sendFCMNotification(toUsername, fromUsername, message string) {
+	if fcmClient == nil {
+		log.Println("⚠️ FCM client not initialized, skipping notification")
+		return
+	}
+
+	// Get recipient's FCM token
+	var user User
+	err := usersColl.FindOne(context.TODO(), bson.M{"username": toUsername}).Decode(&user)
+	if err != nil {
+		log.Printf("❌ Failed to find user %s for FCM: %v", toUsername, err)
+		return
+	}
+
+	if user.FCMToken == "" {
+		log.Printf("⚠️ No FCM token for user %s", toUsername)
+		return
+	}
+
+	// Create FCM message
+	fcmMessage := &messaging.Message{
+		Token: user.FCMToken,
+		Notification: &messaging.Notification{
+			Title: fmt.Sprintf("New message from %s", fromUsername),
+			Body:  message,
+		},
+		Data: map[string]string{
+			"from":    fromUsername,
+			"to":      toUsername,
+			"type":    "message",
+			"content": message,
+		},
+		Android: &messaging.AndroidConfig{
+			Priority: "high",
+			Notification: &messaging.AndroidNotification{
+				Icon:  "ic_notification",
+				Color: "#4CAF50",
+				Sound: "default",
+			},
+		},
+		APNS: &messaging.APNSConfig{
+			Payload: &messaging.APNSPayload{
+				Aps: &messaging.Aps{
+					Badge: func() *int { i := 1; return &i }(),
+					Sound: "default",
+				},
+			},
+		},
+	}
+
+	// Send notification
+	response, err := fcmClient.Send(context.Background(), fcmMessage)
+	if err != nil {
+		log.Printf("❌ Failed to send FCM notification: %v", err)
+		return
+	}
+
+	log.Printf("✅ FCM notification sent to %s: %s", toUsername, response)
+}
 func registerUser(c *fiber.Ctx) error {
 	log.Printf("📝 Registration/Login request from %s", c.IP())
 
@@ -237,18 +350,18 @@ func registerUser(c *fiber.Ctx) error {
 	if err == nil {
 		// User already exists - this is essentially a "login"
 		log.Printf("✅ User already exists, logging in: %s", user.Username)
-		
+
 		// Update the user's online status if needed
 		usersColl.UpdateOne(
 			context.TODO(),
 			bson.M{"username": user.Username},
 			bson.M{"$set": bson.M{"is_online": true}},
 		)
-		
+
 		return c.JSON(fiber.Map{
-			"user": existingUser,
+			"user":    existingUser,
 			"message": "Welcome back!",
-			"action": "login",
+			"action":  "login",
 		})
 	} else if err != mongo.ErrNoDocuments {
 		// Some other database error occurred
@@ -270,9 +383,9 @@ func registerUser(c *fiber.Ctx) error {
 			if err == nil {
 				log.Printf("✅ User was created concurrently, returning existing data: %s", user.Username)
 				return c.JSON(fiber.Map{
-					"user": existingUser,
+					"user":    existingUser,
 					"message": "Welcome back!",
-					"action": "login",
+					"action":  "login",
 				})
 			}
 		}
@@ -282,9 +395,9 @@ func registerUser(c *fiber.Ctx) error {
 
 	log.Printf("✅ User registered successfully: %s", user.Username)
 	return c.JSON(fiber.Map{
-		"user": user,
+		"user":    user,
 		"message": "Welcome! Your account has been created.",
-		"action": "register",
+		"action":  "register",
 	})
 }
 
@@ -324,7 +437,7 @@ func getMessageHistory(c *fiber.Ctx) error {
 	// Query messages by room_id for better performance and consistency
 	filter := bson.M{"room_id": roomID}
 	opts := options.Find().SetSort(bson.D{{Key: "timestamp", Value: 1}})
-	
+
 	cursor, err := msgsColl.Find(context.TODO(), filter, opts)
 	if err != nil {
 		log.Printf("❌ Failed to fetch messages: %v", err)
@@ -381,9 +494,9 @@ func markMessagesAsRead(c *fiber.Ctx) error {
 		"to":      req.Username,
 		"is_read": false,
 	}
-	
+
 	update := bson.M{"$set": bson.M{"is_read": true}}
-	
+
 	result, err := msgsColl.UpdateMany(context.TODO(), filter, update)
 	if err != nil {
 		log.Printf("❌ Failed to mark messages as read: %v", err)
@@ -497,17 +610,20 @@ func handleMessage(wsMsg WebSocketMessage) {
 	// Send message to recipient if online
 	if recipient, ok := clients[wsMsg.To]; ok {
 		recipient.Conn.WriteJSON(response)
-		
+
 		// Mark as delivered
 		msgsColl.UpdateOne(
 			context.TODO(),
 			bson.M{"_id": message.ID},
 			bson.M{"$set": bson.M{"is_delivered": true}},
 		)
-		
+
 		log.Printf("✅ Message delivered to %s in room %s", wsMsg.To, roomID)
 	} else {
 		log.Printf("⚠️ Recipient %s is offline, message saved to room %s", wsMsg.To, roomID)
+
+		// ADD THIS: Send FCM notification if user is offline
+		sendFCMNotification(wsMsg.To, wsMsg.From, wsMsg.Content)
 	}
 
 	// Also send confirmation back to sender
@@ -525,7 +641,7 @@ func handleJoinRoom(wsMsg WebSocketMessage, client *Client) {
 				log.Printf("❌ Failed to join room: %v", err)
 				return
 			}
-			
+
 			response := WebSocketMessage{
 				Type: "room_joined",
 				Data: map[string]interface{}{
